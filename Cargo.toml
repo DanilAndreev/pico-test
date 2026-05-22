@@ -1,0 +1,34 @@
+[package]
+name = "pico-blink"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pico-blink"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+embedded-hal = "1.0"
+panic-halt = "0.2"
+rp-pico = "0.9"
+
+[profile.dev]
+codegen-units = 1
+debug = 2
+debug-assertions = true
+incremental = false
+opt-level = "z"
+overflow-checks = true
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = 3
+overflow-checks = false
