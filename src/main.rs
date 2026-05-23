@@ -1,45 +1,67 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::digital::OutputPin;
+use cyw43_pio::PioSpi;
+use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{DMA_CH0, PIO0};
+use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_time::Timer;
 use panic_halt as _;
-use rp_pico::entry;
-use rp_pico::hal::{self, clocks::Clock, pac, watchdog::Watchdog, Sio};
+use static_cell::StaticCell;
 
-#[entry]
-fn main() -> ! {
-    let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let sio = Sio::new(pac.SIO);
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+});
 
-    let clocks = hal::clocks::init_clocks_and_plls(
-        rp_pico::XOSC_CRYSTAL_FREQ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .ok()
-    .unwrap();
+#[embassy_executor::task]
+async fn cyw43_task(
+    runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
+) -> ! {
+    runner.run().await
+}
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
 
-    let pins = rp_pico::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
+    // CYW43439 firmware blobs (downloaded into cyw43-firmware/).
+    let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
+    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+
+    // Pico W wiring between RP2040 and CYW43439:
+    //   PIN_23 -> WL_REG_ON (power enable)
+    //   PIN_24 -> WL_DATA   (PIO-SPI MOSI/MISO half-duplex)
+    //   PIN_25 -> WL_CS     (SPI chip select)
+    //   PIN_29 -> WL_CLK    (SPI clock)
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        p.DMA_CH0,
     );
 
-    let mut led = pins.led.into_push_pull_output();
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    spawner.spawn(cyw43_task(runner)).unwrap();
+
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
 
     loop {
-        led.set_high().unwrap();
-        delay.delay_ms(500);
-        led.set_low().unwrap();
-        delay.delay_ms(500);
+        control.gpio_set(0, true).await;
+        Timer::after_millis(500).await;
+        control.gpio_set(0, false).await;
+        Timer::after_millis(500).await;
     }
 }
