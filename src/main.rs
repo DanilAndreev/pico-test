@@ -5,14 +5,16 @@ use cyw43_pio::PioSpi;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH0, PIO0};
-use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::Timer;
 use panic_halt as _;
 use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
 
 #[embassy_executor::task]
@@ -22,19 +24,25 @@ async fn cyw43_task(
     runner.run().await
 }
 
+#[embassy_executor::task]
+async fn logger_task(driver: Driver<'static, USB>) {
+    // Routes `log::*!` to a USB-CDC ACM serial device on the same USB port
+    // used for flashing. 1024 = log buffer size in bytes.
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // CYW43439 firmware blobs (downloaded into cyw43-firmware/).
+    // Bring up the USB serial logger first so subsequent init steps can log.
+    let usb_driver = Driver::new(p.USB, Irqs);
+    spawner.spawn(logger_task(usb_driver)).unwrap();
+
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
 
-    // Pico W wiring between RP2040 and CYW43439:
-    //   PIN_23 -> WL_REG_ON (power enable)
-    //   PIN_24 -> WL_DATA   (PIO-SPI MOSI/MISO half-duplex)
-    //   PIN_25 -> WL_CS     (SPI chip select)
-    //   PIN_29 -> WL_CLK    (SPI clock)
+    // Pico W wiring between RP2040 and CYW43439.
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let mut pio = Pio::new(p.PIO0, Irqs);
@@ -58,10 +66,18 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
+    log::info!("Pico W initialized, starting blink loop");
+
+    let mut tick: u32 = 0;
     loop {
         control.gpio_set(0, true).await;
+        log::info!("tick {tick}: LED on");
         Timer::after_millis(500).await;
+
         control.gpio_set(0, false).await;
+        log::info!("tick {tick}: LED off");
         Timer::after_millis(500).await;
+
+        tick = tick.wrapping_add(1);
     }
 }
