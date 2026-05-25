@@ -100,7 +100,7 @@ async fn dhcp_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
     log::info!("dhcp: listening on UDP 67");
 
     let mut packet = [0u8; 600];
-    let mut reply = [0u8; 320];
+    let mut reply = [0u8; 384];
 
     loop {
         let (n, _from) = match sock.recv_from(&mut packet).await {
@@ -166,11 +166,19 @@ async fn dhcp_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
         reply[o + 1] = 4;
         reply[o + 2..o + 6].copy_from_slice(&SERVER_IP);
         o += 6;
-        // 6: DNS server (point at ourselves; we don't actually run DNS)
+        // 6: DNS server (point at ourselves)
         reply[o] = 6;
         reply[o + 1] = 4;
         reply[o + 2..o + 6].copy_from_slice(&SERVER_IP);
         o += 6;
+        // 114: captive portal URI (RFC 7710/8910). Modern iOS/Android
+        // honor this and skip their HTTP probe — the "Sign in to network"
+        // sheet pops up as soon as DHCP completes.
+        const PORTAL_URL: &[u8] = b"http://192.168.4.1/";
+        reply[o] = 114;
+        reply[o + 1] = PORTAL_URL.len() as u8;
+        reply[o + 2..o + 2 + PORTAL_URL.len()].copy_from_slice(PORTAL_URL);
+        o += 2 + PORTAL_URL.len();
         // 255: end
         reply[o] = 255;
         o += 1;
@@ -218,9 +226,118 @@ fn find_dhcp_option(buf: &[u8], code: u8) -> Option<&[u8]> {
 }
 
 // ------------------------------------------------------------------
-// HTTP server
+// Minimal DNS server (captive portal hijack)
+//
+// Returns SERVER_IP as the A record for *any* hostname. AAAA and other
+// query types get an empty (NOERROR/no-data) reply. This is what makes
+// the OS captive-portal probes hit our HTTP server.
 // ------------------------------------------------------------------
 #[embassy_executor::task]
+async fn dns_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
+    let mut rx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_meta = [PacketMetadata::EMPTY; 4];
+    let mut rx_buf = [0u8; 1024];
+    let mut tx_buf = [0u8; 1024];
+
+    let mut sock =
+        UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+
+    if sock.bind(53).is_err() {
+        log::error!("dns: bind(53) failed");
+        loop {
+            Timer::after_secs(60).await;
+        }
+    }
+    log::info!("dns: listening on UDP 53");
+
+    let mut packet = [0u8; 512];
+    let mut reply = [0u8; 512];
+
+    loop {
+        let (n, from) = match sock.recv_from(&mut packet).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if n < 12 {
+            continue;
+        }
+
+        // Walk question name to find QTYPE/QCLASS and end of question.
+        let mut p = 12;
+        let mut name_ok = false;
+        while p < n {
+            let len = packet[p] as usize;
+            if len == 0 {
+                p += 1;
+                name_ok = true;
+                break;
+            }
+            if len & 0xc0 == 0xc0 {
+                p += 2;
+                name_ok = true;
+                break;
+            }
+            p += 1 + len;
+        }
+        if !name_ok || p + 4 > n {
+            continue;
+        }
+        let qtype = u16::from_be_bytes([packet[p], packet[p + 1]]);
+        p += 4; // qtype + qclass
+        let q_end = p;
+
+        // Build reply.
+        for b in reply.iter_mut() {
+            *b = 0;
+        }
+        reply[0] = packet[0]; // ID
+        reply[1] = packet[1];
+        reply[2] = 0x81; // QR=1, Opcode=0, AA=0, TC=0, RD=copied
+        reply[3] = 0x80; // RA=1, Z=0, RCODE=0
+        reply[4] = 0; // QDCOUNT = 1
+        reply[5] = 1;
+        let answer_a = qtype == 1; // only synthesize for A
+        reply[6] = 0; // ANCOUNT
+        reply[7] = if answer_a { 1 } else { 0 };
+        // NSCOUNT/ARCOUNT = 0
+
+        // Echo the question section back.
+        let q_start = 12;
+        let q_len = q_end - q_start;
+        reply[q_start..q_start + q_len].copy_from_slice(&packet[q_start..q_end]);
+        let mut out = q_start + q_len;
+
+        if answer_a {
+            // Name: pointer to offset 12 (start of question name).
+            reply[out] = 0xc0;
+            reply[out + 1] = 0x0c;
+            // TYPE = A
+            reply[out + 2] = 0;
+            reply[out + 3] = 1;
+            // CLASS = IN
+            reply[out + 4] = 0;
+            reply[out + 5] = 1;
+            // TTL = 60s
+            reply[out + 6..out + 10].copy_from_slice(&60u32.to_be_bytes());
+            // RDLENGTH = 4
+            reply[out + 10] = 0;
+            reply[out + 11] = 4;
+            // RDATA = 192.168.4.1
+            reply[out + 12..out + 16].copy_from_slice(&SERVER_IP);
+            out += 16;
+        }
+
+        let _ = sock.send_to(&reply[..out], from).await;
+    }
+}
+
+// ------------------------------------------------------------------
+// HTTP server
+// ------------------------------------------------------------------
+// Pool size 4 lets us accept 4 parallel TCP connections on :80.
+// iOS's captive sheet opens several at once (page + reachability probes);
+// a single-socket server hits "could not connect" on the parallel ones.
+#[embassy_executor::task(pool_size = 4)]
 async fn http_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
     let mut rx = [0u8; 1536];
     let mut tx = [0u8; 1536];
@@ -229,14 +346,16 @@ async fn http_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
         let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
         socket.set_timeout(Some(embassy_time::Duration::from_secs(15)));
 
-        log::info!("http: waiting on :80");
         if socket.accept(80).await.is_err() {
             continue;
         }
+        log::info!("http: accepted");
 
         let _ = serve(&mut socket).await;
-        socket.close();
+        // Drain pending bytes BEFORE sending FIN so the response is fully
+        // transmitted (close() queues the FIN; flush() waits for ACK).
         let _ = socket.flush().await;
+        socket.close();
     }
 }
 
@@ -379,18 +498,23 @@ async fn main(spawner: Spawner) {
     });
 
     let seed = RoscRng.next_u64();
-    static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+    // Sockets: 4 HTTP + 2 UDP (DHCP, DNS) + headroom for parallel accepts.
+    static RESOURCES: StaticCell<StackResources<12>> = StaticCell::new();
     static STACK: StaticCell<Stack<NetDriver<'static>>> = StaticCell::new();
     let stack = STACK.init(Stack::new(
         net_device,
         config,
-        RESOURCES.init(StackResources::<6>::new()),
+        RESOURCES.init(StackResources::<12>::new()),
         seed,
     ));
 
     spawner.spawn(net_task(stack)).unwrap();
     spawner.spawn(dhcp_task(stack)).unwrap();
-    spawner.spawn(http_task(stack)).unwrap();
+    spawner.spawn(dns_task(stack)).unwrap();
+    // Four HTTP worker tasks, each holding its own listening TCP socket.
+    for _ in 0..4 {
+        spawner.spawn(http_task(stack)).unwrap();
+    }
     spawner.spawn(blink_task(control)).unwrap();
 
     log::info!("AP up. Join '{SSID}' WiFi, then open http://192.168.4.1/");

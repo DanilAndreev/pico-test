@@ -17,7 +17,7 @@ static_cell = "2.1"
 portable-atomic = { version = "1", features = ["critical-section"] }
 
 embassy-executor = { version = "0.6", features = [
-    "task-arena-size-32768",
+    "task-arena-size-65536",
     "arch-cortex-m",
     "executor-thread",
     "integrated-timers",
