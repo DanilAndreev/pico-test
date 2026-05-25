@@ -1,8 +1,9 @@
 #![no_std]
 #![no_main]
 
+mod settings;
+
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use cyw43::{Control, NetDriver};
 use cyw43_pio::PioSpi;
@@ -14,6 +15,7 @@ use embassy_net::{
 };
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
+use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioIH, Pio};
@@ -24,6 +26,8 @@ use heapless::String as HString;
 use panic_halt as _;
 use rand_core::RngCore;
 use static_cell::StaticCell;
+
+use crate::settings::SettingsStore;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioIH<PIO0>;
@@ -36,11 +40,9 @@ bind_interrupts!(struct Irqs {
 const SSID: &str = "PicoBlink";
 const WIFI_CHANNEL: u8 = 5;
 const SERVER_IP: [u8; 4] = [192, 168, 4, 1];
-const CLIENT_IP: [u8; 4] = [192, 168, 4, 42]; // single-client lease
+const CLIENT_IP: [u8; 4] = [192, 168, 4, 42];
 
-// LED half-period in milliseconds. 500 = 1 Hz blink.
-// Atomically updated by the HTTP handler, read by the blink task.
-static HALF_PERIOD_MS: AtomicU32 = AtomicU32::new(500);
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 
@@ -65,9 +67,9 @@ async fn net_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn blink_task(mut control: Control<'static>) -> ! {
+async fn blink_task(mut control: Control<'static>, settings: &'static SettingsStore) -> ! {
     loop {
-        let half = HALF_PERIOD_MS.load(Ordering::Relaxed) as u64;
+        let half = settings.blink_half_period_ms() as u64;
         control.gpio_set(0, true).await;
         Timer::after_millis(half).await;
         control.gpio_set(0, false).await;
@@ -76,10 +78,7 @@ async fn blink_task(mut control: Control<'static>) -> ! {
 }
 
 // ------------------------------------------------------------------
-// Minimal DHCP server
-//
-// Handles DISCOVER -> OFFER and REQUEST -> ACK for a single client.
-// Hands out CLIENT_IP, advertises us as router/DNS, /24 subnet.
+// DHCP server
 // ------------------------------------------------------------------
 #[embassy_executor::task]
 async fn dhcp_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
@@ -90,7 +89,6 @@ async fn dhcp_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
 
     let mut sock =
         UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
-
     if sock.bind(67).is_err() {
         log::error!("dhcp: bind(67) failed");
         loop {
@@ -135,51 +133,42 @@ async fn dhcp_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
         reply[1] = 1; // ethernet
         reply[2] = 6; // hlen
         reply[4..8].copy_from_slice(&xid);
-        reply[16..20].copy_from_slice(&CLIENT_IP); // yiaddr
-        reply[20..24].copy_from_slice(&SERVER_IP); // siaddr
-        reply[28..44].copy_from_slice(&chaddr); // chaddr
-        reply[236..240].copy_from_slice(&[99, 130, 83, 99]); // magic cookie
+        reply[16..20].copy_from_slice(&CLIENT_IP);
+        reply[20..24].copy_from_slice(&SERVER_IP);
+        reply[28..44].copy_from_slice(&chaddr);
+        reply[236..240].copy_from_slice(&[99, 130, 83, 99]);
 
         let mut o = 240;
-        // 53: DHCP message type
         reply[o] = 53;
         reply[o + 1] = 1;
         reply[o + 2] = resp_type;
         o += 3;
-        // 54: server identifier
         reply[o] = 54;
         reply[o + 1] = 4;
         reply[o + 2..o + 6].copy_from_slice(&SERVER_IP);
         o += 6;
-        // 51: lease time (1 h)
         reply[o] = 51;
         reply[o + 1] = 4;
         reply[o + 2..o + 6].copy_from_slice(&3600u32.to_be_bytes());
         o += 6;
-        // 1: subnet mask
         reply[o] = 1;
         reply[o + 1] = 4;
         reply[o + 2..o + 6].copy_from_slice(&[255, 255, 255, 0]);
         o += 6;
-        // 3: router
         reply[o] = 3;
         reply[o + 1] = 4;
         reply[o + 2..o + 6].copy_from_slice(&SERVER_IP);
         o += 6;
-        // 6: DNS server (point at ourselves)
         reply[o] = 6;
         reply[o + 1] = 4;
         reply[o + 2..o + 6].copy_from_slice(&SERVER_IP);
         o += 6;
-        // 114: captive portal URI (RFC 7710/8910). Modern iOS/Android
-        // honor this and skip their HTTP probe — the "Sign in to network"
-        // sheet pops up as soon as DHCP completes.
+        // Option 114: captive portal URL (RFC 7710/8910).
         const PORTAL_URL: &[u8] = b"http://192.168.4.1/";
         reply[o] = 114;
         reply[o + 1] = PORTAL_URL.len() as u8;
         reply[o + 2..o + 2 + PORTAL_URL.len()].copy_from_slice(PORTAL_URL);
         o += 2 + PORTAL_URL.len();
-        // 255: end
         reply[o] = 255;
         o += 1;
 
@@ -226,11 +215,7 @@ fn find_dhcp_option(buf: &[u8], code: u8) -> Option<&[u8]> {
 }
 
 // ------------------------------------------------------------------
-// Minimal DNS server (captive portal hijack)
-//
-// Returns SERVER_IP as the A record for *any* hostname. AAAA and other
-// query types get an empty (NOERROR/no-data) reply. This is what makes
-// the OS captive-portal probes hit our HTTP server.
+// DNS server (captive portal hijack)
 // ------------------------------------------------------------------
 #[embassy_executor::task]
 async fn dns_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
@@ -241,7 +226,6 @@ async fn dns_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
 
     let mut sock =
         UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
-
     if sock.bind(53).is_err() {
         log::error!("dns: bind(53) failed");
         loop {
@@ -262,7 +246,6 @@ async fn dns_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
             continue;
         }
 
-        // Walk question name to find QTYPE/QCLASS and end of question.
         let mut p = 12;
         let mut name_ok = false;
         while p < n {
@@ -283,46 +266,37 @@ async fn dns_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
             continue;
         }
         let qtype = u16::from_be_bytes([packet[p], packet[p + 1]]);
-        p += 4; // qtype + qclass
+        p += 4;
         let q_end = p;
 
-        // Build reply.
         for b in reply.iter_mut() {
             *b = 0;
         }
-        reply[0] = packet[0]; // ID
+        reply[0] = packet[0];
         reply[1] = packet[1];
-        reply[2] = 0x81; // QR=1, Opcode=0, AA=0, TC=0, RD=copied
-        reply[3] = 0x80; // RA=1, Z=0, RCODE=0
-        reply[4] = 0; // QDCOUNT = 1
+        reply[2] = 0x81;
+        reply[3] = 0x80;
+        reply[4] = 0;
         reply[5] = 1;
-        let answer_a = qtype == 1; // only synthesize for A
-        reply[6] = 0; // ANCOUNT
+        let answer_a = qtype == 1;
+        reply[6] = 0;
         reply[7] = if answer_a { 1 } else { 0 };
-        // NSCOUNT/ARCOUNT = 0
 
-        // Echo the question section back.
         let q_start = 12;
         let q_len = q_end - q_start;
         reply[q_start..q_start + q_len].copy_from_slice(&packet[q_start..q_end]);
         let mut out = q_start + q_len;
 
         if answer_a {
-            // Name: pointer to offset 12 (start of question name).
             reply[out] = 0xc0;
             reply[out + 1] = 0x0c;
-            // TYPE = A
             reply[out + 2] = 0;
             reply[out + 3] = 1;
-            // CLASS = IN
             reply[out + 4] = 0;
             reply[out + 5] = 1;
-            // TTL = 60s
             reply[out + 6..out + 10].copy_from_slice(&60u32.to_be_bytes());
-            // RDLENGTH = 4
             reply[out + 10] = 0;
             reply[out + 11] = 4;
-            // RDATA = 192.168.4.1
             reply[out + 12..out + 16].copy_from_slice(&SERVER_IP);
             out += 16;
         }
@@ -334,13 +308,13 @@ async fn dns_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
 // ------------------------------------------------------------------
 // HTTP server
 // ------------------------------------------------------------------
-// Pool size 4 lets us accept 4 parallel TCP connections on :80.
-// iOS's captive sheet opens several at once (page + reachability probes);
-// a single-socket server hits "could not connect" on the parallel ones.
 #[embassy_executor::task(pool_size = 4)]
-async fn http_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
-    let mut rx = [0u8; 1536];
-    let mut tx = [0u8; 1536];
+async fn http_task(
+    stack: &'static Stack<NetDriver<'static>>,
+    settings: &'static SettingsStore,
+) -> ! {
+    let mut rx = [0u8; 2048];
+    let mut tx = [0u8; 2048];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
@@ -351,33 +325,70 @@ async fn http_task(stack: &'static Stack<NetDriver<'static>>) -> ! {
         }
         log::info!("http: accepted");
 
-        let _ = serve(&mut socket).await;
-        // Drain pending bytes BEFORE sending FIN so the response is fully
-        // transmitted (close() queues the FIN; flush() waits for ACK).
+        let _ = serve(&mut socket, settings).await;
         let _ = socket.flush().await;
         socket.close();
     }
 }
 
-async fn serve(s: &mut TcpSocket<'_>) -> Result<(), ()> {
-    let mut buf = [0u8; 1024];
+async fn serve(s: &mut TcpSocket<'_>, settings: &'static SettingsStore) -> Result<(), ()> {
+    let mut buf = [0u8; 2048];
     let n = s.read(&mut buf).await.map_err(|_| ())?;
     let req = core::str::from_utf8(&buf[..n]).unwrap_or("");
     let line = req.lines().next().unwrap_or("");
     log::info!("http: {}", line);
 
+    // --- Form: quick blink frequency change ---
     if line.starts_with("GET /set") {
         if let Some(hz) = parse_hz(line) {
-            let hz = hz.clamp(1, 20);
-            HALF_PERIOD_MS.store(500 / hz, Ordering::Relaxed);
-            log::info!("http: blink rate -> {hz} Hz");
+            if let Err(e) = settings.set_blink_hz(hz).await {
+                log::warn!("settings: set_blink_hz failed: {:?}", e);
+            } else {
+                log::info!("settings: blink_hz -> {hz}");
+            }
         }
-        redirect(s, "/").await
-    } else if line.starts_with("GET /") {
-        index(s).await
-    } else {
-        status(s, 404, "Not Found").await
+        return redirect(s, "/").await;
     }
+
+    // --- API: reset to embedded defaults ---
+    if line.starts_with("POST /api/reset") || line.starts_with("GET /api/reset") {
+        match settings.reset().await {
+            Ok(_) => log::info!("settings: reset to defaults"),
+            Err(e) => log::warn!("settings: reset failed: {:?}", e),
+        }
+        return redirect(s, "/").await;
+    }
+
+    // --- API: import partial JSON ---
+    if line.starts_with("POST /api/settings") {
+        let body = extract_body(req).unwrap_or("");
+        match settings.import_json(body.as_bytes()).await {
+            Ok(_) => {
+                log::info!("settings: imported {} bytes of JSON", body.len());
+                return status(s, 200, "OK").await;
+            }
+            Err(e) => {
+                log::warn!("settings: import failed: {:?}", e);
+                return status(s, 400, "Bad Request").await;
+            }
+        }
+    }
+
+    // --- API: export current settings as JSON ---
+    if line.starts_with("GET /api/settings") {
+        let mut buf = [0u8; 256];
+        return match settings.export_json(&mut buf).await {
+            Ok(slice) => send_json(s, slice).await,
+            Err(_) => status(s, 500, "Internal Error").await,
+        };
+    }
+
+    // --- Anything else: serve the settings page (captive portal hits land here) ---
+    if line.starts_with("GET /") {
+        return index(s, settings).await;
+    }
+
+    status(s, 404, "Not Found").await
 }
 
 fn parse_hz(line: &str) -> Option<u32> {
@@ -392,15 +403,21 @@ fn parse_hz(line: &str) -> Option<u32> {
     None
 }
 
-async fn index(s: &mut TcpSocket<'_>) -> Result<(), ()> {
-    let half = HALF_PERIOD_MS.load(Ordering::Relaxed).max(1);
-    let hz = 500 / half;
+/// Returns the body slice from a parsed HTTP request (everything after the
+/// first `\r\n\r\n`). For requests larger than the read buffer this only
+/// returns what we got — fine for our small JSON payloads.
+fn extract_body(req: &str) -> Option<&str> {
+    req.split_once("\r\n\r\n").map(|(_, body)| body)
+}
+
+async fn index(s: &mut TcpSocket<'_>, settings: &'static SettingsStore) -> Result<(), ()> {
+    let snapshot = settings.current().await;
 
     let mut hz_str: HString<8> = HString::new();
-    let _ = write!(hz_str, "{hz}");
+    let _ = write!(hz_str, "{}", snapshot.blink_hz);
 
-    // Template substitution: HTML has two {{HZ}} markers.
-    let parts: heapless::Vec<&str, 3> = INDEX_HTML.split("{{HZ}}").collect();
+    // INDEX_HTML may contain multiple {{HZ}} placeholders.
+    let parts: heapless::Vec<&str, 8> = INDEX_HTML.split("{{HZ}}").collect();
     let body_len: usize =
         parts.iter().map(|p| p.len()).sum::<usize>() + hz_str.len() * (parts.len() - 1);
 
@@ -417,6 +434,18 @@ async fn index(s: &mut TcpSocket<'_>) -> Result<(), ()> {
             s.write_all(hz_str.as_bytes()).await.map_err(|_| ())?;
         }
     }
+    Ok(())
+}
+
+async fn send_json(s: &mut TcpSocket<'_>, body: &[u8]) -> Result<(), ()> {
+    let mut header: HString<160> = HString::new();
+    let _ = write!(
+        header,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+    );
+    s.write_all(header.as_bytes()).await.map_err(|_| ())?;
+    s.write_all(body).await.map_err(|_| ())?;
     Ok(())
 }
 
@@ -447,16 +476,19 @@ async fn status(s: &mut TcpSocket<'_>, code: u16, reason: &str) -> Result<(), ()
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // USB-CDC serial logger (so we can watch DHCP/HTTP events).
     spawner.spawn(logger_task(Driver::new(p.USB, Irqs))).unwrap();
     Timer::after_millis(200).await;
     log::info!("Pico W booting");
 
-    // CYW43 firmware blobs.
+    // Initialize flash + settings store. Reads the last sector; falls back
+    // to compile-time defaults from default-settings.json on first boot.
+    let flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+    static SETTINGS_CELL: StaticCell<SettingsStore> = StaticCell::new();
+    let settings: &'static SettingsStore = SETTINGS_CELL.init(SettingsStore::init(flash));
+
+    // CYW43 wireless chip
     let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
-
-    // PIO-SPI link to the wireless chip.
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let mut pio = Pio::new(p.PIO0, Irqs);
@@ -482,7 +514,7 @@ async fn main(spawner: Spawner) {
     log::info!("Starting open AP: SSID='{SSID}', channel {WIFI_CHANNEL}");
     control.start_ap_open(SSID, WIFI_CHANNEL).await;
 
-    // Embassy-net stack with static IP. We act as gateway/DNS/server.
+    // Network stack
     let config = Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(
             Ipv4Address::new(SERVER_IP[0], SERVER_IP[1], SERVER_IP[2], SERVER_IP[3]),
@@ -498,7 +530,6 @@ async fn main(spawner: Spawner) {
     });
 
     let seed = RoscRng.next_u64();
-    // Sockets: 4 HTTP + 2 UDP (DHCP, DNS) + headroom for parallel accepts.
     static RESOURCES: StaticCell<StackResources<12>> = StaticCell::new();
     static STACK: StaticCell<Stack<NetDriver<'static>>> = StaticCell::new();
     let stack = STACK.init(Stack::new(
@@ -511,16 +542,15 @@ async fn main(spawner: Spawner) {
     spawner.spawn(net_task(stack)).unwrap();
     spawner.spawn(dhcp_task(stack)).unwrap();
     spawner.spawn(dns_task(stack)).unwrap();
-    // Four HTTP worker tasks, each holding its own listening TCP socket.
     for _ in 0..4 {
-        spawner.spawn(http_task(stack)).unwrap();
+        spawner.spawn(http_task(stack, settings)).unwrap();
     }
-    spawner.spawn(blink_task(control)).unwrap();
+    spawner.spawn(blink_task(control, settings)).unwrap();
 
     log::info!("AP up. Join '{SSID}' WiFi, then open http://192.168.4.1/");
     loop {
         Timer::after_secs(30).await;
-        let hz = 500 / HALF_PERIOD_MS.load(Ordering::Relaxed).max(1);
-        log::info!("alive; current blink rate {hz} Hz");
+        let snap = settings.current().await;
+        log::info!("alive; current blink {} Hz", snap.blink_hz);
     }
 }
