@@ -39,6 +39,16 @@ cyw43-pio = "0.2"
 embassy-usb-logger = "0.2"
 log = "0.4"
 
+embassy-net = { version = "0.4", features = [
+    "tcp",
+    "udp",
+    "proto-ipv4",
+    "medium-ethernet",
+] }
+embedded-io-async = "0.6"
+heapless = "0.8"
+rand_core = "0.6"
+
 [profile.dev]
 codegen-units = 1
 debug = 2
